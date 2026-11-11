@@ -11,6 +11,10 @@ export interface DashboardData {
   marks: Map<string, number>;
   leaders: { address: string; label?: string }[];
   lines: string[];
+  /** Seconds from a leader's block to our seeing it, most recent trades. */
+  lagsSec: number[];
+  /** How leader trades are being received right now. */
+  feed: string;
 }
 
 const esc = (s: unknown) =>
@@ -33,6 +37,8 @@ export function render(d: DashboardData, now = Date.now()): string {
 
   // Unrealized counts only positions that have a price yet.
   const unrealized = positions.reduce((sum, [mint, p]) => sum + (d.marks.has(mint) ? d.marks.get(mint)! - p.costSol : 0), 0);
+  const lags = [...d.lagsSec].sort((a, b) => a - b);
+  const lag = lags.length ? lags[Math.floor(lags.length / 2)] : null; // median
   const closed = d.state.closed;
   const wins = closed.filter((c) => c.pnlSol > 0).length;
 
@@ -61,7 +67,7 @@ a { color:var(--accent); text-decoration:none; } .empty { padding:14px; color:va
 pre { margin:0; padding:12px 14px; font:12px/1.5 ui-monospace,monospace; white-space:pre-wrap; word-break:break-all; max-height:420px; overflow-y:auto; }
 </style></head><body><main>
 <h1>FOMO copytrader <span class="badge">${esc(d.mode)}</span></h1>
-<div class="sub">Up ${upMin} min · refreshes every 5 s · ${esc(new Date(now).toISOString().slice(11, 19))} UTC</div>
+<div class="sub">Up ${upMin} min · refreshes every 5 s · feed: ${esc(d.feed)} · ${esc(new Date(now).toISOString().slice(11, 19))} UTC</div>
 <div class="tiles">
 ${tile('Total PnL', sol(pnl + unrealized), cls(pnl + unrealized))}
 ${tile('Realized', sol(pnl), cls(pnl))}
@@ -69,6 +75,7 @@ ${tile('Unrealized', sol(unrealized), cls(unrealized))}
 ${tile('Winning sells', closed.length ? `${wins} / ${closed.length}` : '–')}
 ${tile('Open positions', `${positions.length} / ${d.limits.maxOpenPositions}`)}
 ${tile('Spent today', `${spent.toFixed(2)} / ${d.limits.maxDailySol} SOL`)}
+${tile('Detection lag', lag === null ? '–' : `${lag.toFixed(1)} s`)}
 </div>
 <h2>Open positions</h2>
 <div class="card">${

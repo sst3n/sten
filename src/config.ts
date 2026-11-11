@@ -11,8 +11,12 @@ export interface Config extends Limits {
   leaderboard?: LeaderboardConfig;
   /** Serve a read-only status page on this port. Off when unset. */
   dashboardPort?: number;
-  /** Pause between polling rounds over all leaders. */
+  /** Seconds between polls of each leader while the websocket feed is off or down. */
   pollSeconds: number;
+  /** Use the websocket push feed (WS_URL, or derived from RPC_URL). */
+  push: boolean;
+  /** Seconds between polls of each leader while push is healthy; a safety net. */
+  backstopPollSeconds: number;
   slippageBps: number;
   priorityFeeLamports: number;
   jupiterBaseUrl: string;
@@ -39,6 +43,8 @@ const DEFAULTS = {
   maxHoldMinutes: 60,
   dropLeaderAfter: 3,
   pollSeconds: 2,
+  push: true,
+  backstopPollSeconds: 15,
   slippageBps: 300,
   priorityFeeLamports: 100_000,
   blockedMints: [],

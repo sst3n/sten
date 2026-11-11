@@ -10,8 +10,10 @@ Jupiter; when that wallet sells, the bot sells the same fraction of its position
 ## How it gets FOMO's trades
 
 FOMO has no public API. Every FOMO user trades from their own on-chain wallet,
-so the bot polls those wallets over Solana RPC every few seconds and reads each
-new transaction's balance changes. It does not talk to FOMO at all.
+so the bot watches those wallets over Solana RPC and reads each new
+transaction's balance changes. A websocket push feed tells it the moment a
+leader transaction confirms; polling runs alongside as a safety net and takes
+over by itself if the websocket is down. It does not talk to FOMO at all.
 
 Two ways to choose who to copy; they can be combined:
 
@@ -62,7 +64,9 @@ Requires Node 22.18+.
 | `maxOpenPositions` | Stop opening positions beyond this many |
 | `maxDailySol` | Cap on SOL spent on buys per UTC day |
 | `minLeaderBuySol` / `minLeaderBuyUsd` | Ignore leader buys smaller than this. FOMO users mostly pay in USDC, so the USD one usually applies |
-| `pollSeconds` | Pause between polling rounds. Each round costs one RPC call per leader |
+| `push` | Use the websocket push feed (`WS_URL`, or derived from `RPC_URL`). Default on |
+| `backstopPollSeconds` | Seconds between polls of each leader while push is healthy |
+| `pollSeconds` | Seconds between polls of each leader while push is off or down. One RPC call per leader per poll |
 | `dashboardPort` | Serve a read-only status page on `http://127.0.0.1:<port>`. Off when unset |
 | `maxRoundTripLossPct` | Skip a buy if selling straight back would lose more than this (thin liquidity). 0 disables |
 | `maxPriceDriftPct` | Skip a buy if the price is this much above what the leader paid. 0 disables |
@@ -81,8 +85,11 @@ Positions and realized PnL are kept in `state.json`.
 - Exits happen when the leader sells, on the stop-loss, or at the hold limit.
   Positions are re-priced every 15 seconds, so a fast crash can overshoot the
   stop-loss. There is no take-profit.
-- A leader trade is seen up to one polling round late. Trades made while the bot
-  is stopped are not replayed.
+- Trades made while the bot is stopped are not replayed. A websocket outage is
+  covered by polling and a backfill poll when it returns.
+- Every leader trade is logged with its detection lag, `[seen +1.2s via push]`:
+  seconds from the leader's block to the bot seeing it. Block times are whole
+  seconds, so a figure can read up to a second too high.
 - Token safety is limited to the round-trip quote check. No checks for freeze
   or mint authority.
 - Token-to-token swaps by a leader are ignored; only SOL/USDC/USDT pairs are copied.
@@ -97,7 +104,8 @@ npm test        # trade decoding and copy rules
 npm run typecheck
 ```
 
-Checked against mainnet: leader polling, decoding of real FOMO trades (the
-user's wallet co-signs each one), and Jupiter quotes in paper mode. Not yet run
+Checked against mainnet: the push feed (8 leaders subscribed; trades seen
+0.9 to 1.8 s after their block), leader polling, decoding of real FOMO trades
+(the user's wallet co-signs each one), and Jupiter quotes in paper mode. Not yet run
 against real services: the Bitquery leaderboard query and live swaps. Run in
 paper mode first.

@@ -1,10 +1,13 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
+import { HttpsProxyAgent } from 'https-proxy-agent';
 import { loadConfig } from './config.ts';
 import { startDashboard } from './dashboard.ts';
-import { decodeTrade, WSOL, type LeaderTrade, type TxLike } from './decode.ts';
+import { decodeTrade, WSOL, type LeaderTrade } from './decode.ts';
+import { LeaderFeed, makeQueue, type FeedMeta } from './feed.ts';
 import { buildSwap, getQuote, type Quote } from './jupiter.ts';
 import { fetchLeaderboard } from './leaderboard.ts';
+import { startPush } from './push.ts';
 import { applyBuy, applySell, checkEntry, decide, emptyState, exitReason, type State } from './strategy.ts';
 
 const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
@@ -19,6 +22,7 @@ const log = (...a: unknown[]) => {
 };
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const nowSec = () => Math.floor(Date.now() / 1000);
+process.on('unhandledRejection', (e) => log('unhandled rejection:', e));
 
 const cfg = loadConfig();
 const tag = cfg.mode === 'paper' ? '[paper]' : '[live]';
@@ -44,7 +48,7 @@ async function rpc(method: string, params: unknown[]): Promise<any> {
       signal: AbortSignal.timeout(15_000),
     });
     if (res.status === 429 && attempt < 4) {
-      await sleep(1000 * (attempt + 1));
+      await sleep(250 * 2 ** attempt + Math.random() * 100); // rate limited: back off briefly, not for seconds
       continue;
     }
     if (!res.ok) throw new Error(`RPC ${method} failed: ${res.status}`);
@@ -54,17 +58,17 @@ async function rpc(method: string, params: unknown[]): Promise<any> {
   }
 }
 
-async function fetchTx(signature: string): Promise<TxLike | null> {
+async function fetchTrade(signature: string, wallet: string): Promise<LeaderTrade | null> {
   // A just-confirmed transaction is sometimes not queryable for a moment.
-  for (let i = 0; i < 4; i++) {
+  for (let i = 0; i < 5; i++) {
     const tx = await rpc('getTransaction', [
       signature,
       { encoding: 'jsonParsed', commitment: 'confirmed', maxSupportedTransactionVersion: 1 },
     ]);
-    if (tx) return tx;
-    await sleep(400 * (i + 1));
+    if (tx) return decodeTrade(tx, wallet);
+    await sleep(250 * (i + 1));
   }
-  return null;
+  throw new Error('transaction not available from the RPC');
 }
 
 async function ourTokenBalance(mint: string): Promise<bigint> {
@@ -103,16 +107,14 @@ async function leaderPrice(trade: LeaderTrade): Promise<number | null> {
 }
 
 async function buy(mint: string, sol: number, leader: Leader, trade: LeaderTrade) {
-  const quote = await getQuote(cfg, WSOL, mint, BigInt(Math.round(sol * 1e9)));
+  const [quote, leaderSolPerToken] = await Promise.all([
+    getQuote(cfg, WSOL, mint, BigInt(Math.round(sol * 1e9))),
+    leaderPrice(trade).catch(() => null),
+  ]);
   const tokensOut = BigInt(quote.outAmount);
   const back = tokensOut > 0n ? await getQuote(cfg, mint, WSOL, tokensOut) : null;
   const reason = checkEntry(
-    {
-      buySol: sol,
-      tokensOut,
-      sellBackSol: back ? Number(back.outAmount) / 1e9 : 0,
-      leaderSolPerToken: await leaderPrice(trade).catch(() => null),
-    },
+    { buySol: sol, tokensOut, sellBackSol: back ? Number(back.outAmount) / 1e9 : 0, leaderSolPerToken },
     cfg,
   );
   if (reason) return log(`  skip: ${reason}`);
@@ -121,7 +123,8 @@ async function buy(mint: string, sol: number, leader: Leader, trade: LeaderTrade
   // Live fills can differ slightly from the quote; sells re-check the real balance.
   applyBuy(state, mint, leader.address, tokensOut, sol, nowSec());
   saveState();
-  log(`  ${tag} bought ${quote.outAmount} raw of ${mint} for ${sol} SOL`);
+  const after = trade.blockTime === null ? '' : ` (${(Date.now() / 1000 - trade.blockTime).toFixed(1)}s after the leader)`;
+  log(`  ${tag} bought ${quote.outAmount} raw of ${mint} for ${sol} SOL${after}`);
 }
 
 async function sell(mint: string, rawAmount: bigint, all: boolean, reason: string) {
@@ -146,60 +149,137 @@ async function sell(mint: string, rawAmount: bigint, all: boolean, reason: strin
 
 type Leader = { address: string; label?: string };
 
-async function handle(signature: string, leader: Leader) {
-  const tx = await fetchTx(signature);
-  if (!tx) return log(`could not fetch ${signature}, skipping`);
-  const trade = decodeTrade(tx, leader.address);
-  if (!trade) return; // not a swap we understand (transfer, failed tx, token-to-token...)
+// Seconds from the leader's block to us seeing it, for the dashboard. Block
+// times are whole seconds, so each figure can read up to a second too high.
+const lagsSec: number[] = [];
 
+async function act(trade: LeaderTrade, leader: Leader, m: FeedMeta) {
+  const started = Date.now();
+  let timing = '';
+  if (trade.blockTime !== null) {
+    const lag = m.seenAt / 1000 - trade.blockTime;
+    lagsSec.push(lag);
+    if (lagsSec.length > 50) lagsSec.shift();
+    timing = ` [seen +${lag.toFixed(1)}s via ${m.via}, fetch ${m.fetchedAt - m.seenAt}ms, queued ${started - m.fetchedAt}ms]`;
+  }
   const name = leader.label ?? leader.address.slice(0, 6);
-  log(`${name} ${trade.side} ${trade.mint} for ${trade.quoteAmount} ${trade.quote}`);
+  log(`${name} ${trade.side} ${trade.mint} for ${trade.quoteAmount} ${trade.quote}${timing}`);
+
   const d = decide(trade, leader.address, state, cfg, nowSec());
   if (d.type === 'skip') return log(`  skip: ${d.reason}`);
   if (d.type === 'buy') await buy(d.mint, d.sol, leader, trade);
   else await sell(d.mint, d.rawAmount, d.all, 'leader sold');
 }
 
+// Everything that changes positions or spend runs through here, one at a time.
+const queue = makeQueue((e) => log('error:', e.message ?? e));
+
 // What each open position would fetch if sold now. Drives our own exits and
 // the dashboard.
 const marks = new Map<string, number>();
-let lastMark = 0;
 
-async function markPositions() {
-  for (const mint of [...marks.keys()]) if (!state.positions[mint]) marks.delete(mint);
-  for (const [mint, p] of Object.entries(state.positions)) {
-    const quote = await getQuote(cfg, mint, WSOL, BigInt(p.tokens)).catch(() => null);
-    if (!quote) continue;
-    const value = Number(quote.outAmount) / 1e9;
-    marks.set(mint, value);
-    const reason = exitReason(p, value, nowSec(), cfg);
-    if (!reason) continue;
-    log(`${reason} on ${mint}: worth ${value.toFixed(4)} SOL, cost ${p.costSol.toFixed(4)} SOL`);
-    await sell(mint, BigInt(p.tokens), true, reason).catch((e) => log(`  exit failed for ${mint}:`, e.message));
+async function markLoop() {
+  while (true) {
+    await sleep(MARK_SECONDS * 1000);
+    const open = Object.entries(state.positions);
+    // Price everything in parallel, outside the queue so leader trades never wait on it.
+    const quotes = await Promise.all(open.map(([mint, p]) => getQuote(cfg, mint, WSOL, BigInt(p.tokens)).catch(() => null)));
+    queue(async () => {
+      for (const mint of [...marks.keys()]) if (!state.positions[mint]) marks.delete(mint);
+      for (let i = 0; i < open.length; i++) {
+        const [mint, seen] = open[i];
+        const pos = state.positions[mint];
+        const quote = quotes[i];
+        if (!quote || !pos || pos.tokens !== seen.tokens) continue; // closed or changed while pricing
+        const value = Number(quote.outAmount) / 1e9;
+        marks.set(mint, value);
+        const reason = exitReason(pos, value, nowSec(), cfg);
+        if (!reason) continue;
+        log(`${reason} on ${mint}: worth ${value.toFixed(4)} SOL, cost ${pos.costSol.toFixed(4)} SOL`);
+        await sell(mint, BigInt(pos.tokens), true, reason).catch((e) => log(`  exit failed for ${mint}:`, e.message));
+      }
+    });
   }
 }
 
-// Leaders are polled over HTTP rather than a websocket: a dropped connection
-// then loses nothing, because each poll resumes from the last seen signature.
-const watched = new Map<string, { leader: Leader; cursor: string | null }>();
+// How we hear about leader trades. Push (websocket) is fastest; polling runs
+// alongside as a safety net, and takes over by itself whenever push is down.
+type Entry = { leader: Leader; cursor: string | null; feed: LeaderFeed<LeaderTrade> };
+const watched = new Map<string, Entry>();
+
+const wsUrl = cfg.wsUrl ?? cfg.rpcUrl.replace(/^http/, 'ws');
+let pushDown = false;
+const proxyUrl = process.env.HTTPS_PROXY || process.env.https_proxy;
+const push = cfg.push
+  ? startPush(
+      wsUrl,
+      (address, signature) => {
+        const entry = watched.get(address);
+        if (entry) entry.feed.ingest(signature, 'push');
+      },
+      {
+        onReady: () => {
+          log('push: connected');
+          pushDown = false;
+          // Trades that landed while it was down.
+          for (const e of watched.values()) pollOnce(e).catch((err) => log('backfill failed:', err.message));
+        },
+        onDown: (why) => {
+          if (pushDown) return; // reconnect attempts repeat the same failure
+          pushDown = true;
+          log(`push: down (${why}); polling every ${cfg.pollSeconds}s until it is back`);
+        },
+      },
+      1000,
+      // Websockets do not follow HTTPS_PROXY by themselves.
+      proxyUrl ? { agent: new HttpsProxyAgent(proxyUrl) } : {},
+    )
+  : null;
 
 async function watch(leader: Leader) {
   if (watched.has(leader.address)) return;
   // Start from the leader's latest transaction so old trades are not replayed.
-  const latest = await rpc('getSignaturesForAddress', [leader.address, { limit: 1, commitment: 'confirmed' }]);
-  watched.set(leader.address, { leader, cursor: latest[0]?.signature ?? null });
+  // Retried patiently: starting up looks up every leader at once and can hit rate limits.
+  let latest: { signature: string }[] = [];
+  for (let attempt = 0; ; attempt++) {
+    try {
+      latest = await rpc('getSignaturesForAddress', [leader.address, { limit: 1, commitment: 'confirmed' }]);
+      break;
+    } catch (e) {
+      if (attempt >= 5) throw e;
+      await sleep(1000 * (attempt + 1));
+    }
+  }
+  const entry: Entry = {
+    leader,
+    cursor: latest[0]?.signature ?? null,
+    feed: new LeaderFeed<LeaderTrade>(
+      (signature) => fetchTrade(signature, leader.address),
+      (trade, meta) => queue(() => act(trade, leader, meta).catch((e) => log(`error on ${meta.signature}:`, e.message))),
+      (signature, e) => log(`error on ${signature}:`, e.message),
+    ),
+  };
+  watched.set(leader.address, entry);
+  push?.add(leader.address);
+  void pollLoop(entry, Math.random() * cfg.pollSeconds * 1000); // spread leaders across the interval
 }
 
-async function poll(entry: { leader: Leader; cursor: string | null }) {
+async function pollOnce(entry: Entry) {
   const sigs: { signature: string; err: unknown }[] = await rpc('getSignaturesForAddress', [
     entry.leader.address,
     { limit: 50, commitment: 'confirmed', ...(entry.cursor ? { until: entry.cursor } : {}) },
   ]);
   if (sigs.length === 0) return;
   entry.cursor = sigs[0].signature; // newest first
-  for (const s of sigs.reverse()) {
-    if (s.err) continue;
-    await handle(s.signature, entry.leader).catch((e) => log(`error on ${s.signature}:`, e.message));
+  for (const s of sigs.reverse()) if (!s.err) entry.feed.ingest(s.signature, 'poll');
+}
+
+async function pollLoop(entry: Entry, startDelayMs: number) {
+  await sleep(startDelayMs);
+  // Each leader polls on its own, so one slow or rate-limited call delays nobody else.
+  while (watched.get(entry.leader.address) === entry) {
+    await pollOnce(entry).catch((e) => log(`poll failed for ${entry.leader.address}:`, e.message));
+    await sleep((push?.healthy() ? cfg.backstopPollSeconds : cfg.pollSeconds) * 1000);
   }
 }
 
@@ -215,7 +295,11 @@ async function refreshLeaderboard() {
     ...board.map((w) => w.address),
     ...Object.values(state.positions).map((p) => p.leader),
   ]);
-  for (const address of [...watched.keys()]) if (!keep.has(address)) watched.delete(address);
+  for (const address of [...watched.keys()]) {
+    if (keep.has(address)) continue;
+    watched.delete(address); // its poll loop ends on its next turn
+    push?.remove(address);
+  }
 }
 
 if (cfg.dashboardPort) {
@@ -230,6 +314,8 @@ if (cfg.dashboardPort) {
     marks,
     leaders: [...watched.values()].map((w) => w.leader),
     lines,
+    lagsSec,
+    feed: !push ? 'polling' : push.healthy() ? 'push' : 'polling (push down)',
   }));
   log(`dashboard on http://${host}:${cfg.dashboardPort}`);
 }
@@ -246,16 +332,8 @@ if (cfg.leaderboard) {
 }
 
 log(`mode=${cfg.mode} watching ${watched.size} leader(s), ${Object.keys(state.positions).length} open position(s)`);
+log(push ? `feed: push (${wsUrl.split('?')[0]}), polling every ${cfg.backstopPollSeconds}s as a safety net` : `feed: polling every ${cfg.pollSeconds}s`);
 if (cfg.mode === 'live') log(`trading wallet ${cfg.keypair!.publicKey.toBase58()}`);
 
-// One leader and one trade at a time, so limits and state are never raced.
-while (true) {
-  if (Date.now() - lastMark > MARK_SECONDS * 1000) {
-    lastMark = Date.now();
-    await markPositions();
-  }
-  for (const entry of [...watched.values()]) {
-    await poll(entry).catch((e) => log(`poll failed for ${entry.leader.address}:`, e.message));
-  }
-  await sleep(cfg.pollSeconds * 1000);
-}
+void markLoop();
+await new Promise<never>(() => {}); // run until stopped

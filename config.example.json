@@ -20,6 +20,8 @@
   "maxHoldMinutes": 60,
   "dropLeaderAfter": 3,
   "pollSeconds": 2,
+  "push": true,
+  "backstopPollSeconds": 15,
   "slippageBps": 300,
   "priorityFeeLamports": 100000,
   "blockedMints": [],

@@ -3,7 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "engines": { "node": ">=22.18" },
+  "engines": {
+    "node": ">=22.18"
+  },
   "scripts": {
     "start": "node --env-file-if-exists=.env src/index.ts",
     "test": "node --test test/*.test.ts",
@@ -11,10 +13,13 @@
   },
   "dependencies": {
     "@solana/web3.js": "^1.98.0",
-    "bs58": "^6.0.0"
+    "bs58": "^6.0.0",
+    "https-proxy-agent": "^7.0.6",
+    "ws": "^8.22.2"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@types/ws": "^8.18.2",
     "typescript": "^5.8.0"
   }
 }
