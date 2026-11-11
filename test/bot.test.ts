@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeTrade, WSOL, type TxLike } from '../src/decode.ts';
 import { rankWallets } from '../src/leaderboard.ts';
-import { applyBuy, applySell, decide, emptyState, type Limits } from '../src/strategy.ts';
+import { applyBuy, applySell, checkEntry, decide, emptyState, exitReason, type Limits } from '../src/strategy.ts';
 
 const LEADER = 'Leader1111111111111111111111111111111111111';
 const OTHER = 'Other11111111111111111111111111111111111111';
@@ -102,6 +102,11 @@ const LIM: Limits = {
   minLeaderBuyUsd: 100,
   maxTradeAgeSec: 30,
   blockedMints: ['Blocked'],
+  maxRoundTripLossPct: 6,
+  maxPriceDriftPct: 5,
+  stopLossPct: 25,
+  maxHoldMinutes: 60,
+  dropLeaderAfter: 2,
 };
 const buy = (mint = MINT, quoteAmount = 1, blockTime = 1000) =>
   ({ side: 'buy', mint, decimals: 6, tokenPre: 0n, tokenPost: 500n, quote: 'SOL', quoteAmount, blockTime }) as const;
@@ -143,13 +148,13 @@ test('sells mirror the leader fraction, only for the leader that opened the posi
     rawAmount: 200n,
     all: false,
   });
-  applySell(s, MINT, 200n, 0.05);
+  applySell(s, MINT, 200n, 0.05, 5000, 'leader sold');
   assert.equal(s.positions[MINT].tokens, '600');
   assert.ok(Math.abs(s.positions[MINT].costSol - 0.075) < 1e-12);
   assert.ok(Math.abs(s.realizedPnlSol - 0.025) < 1e-12);
 
   assert.deepEqual(decide(sell(750n, 0n), LEADER, s, LIM, 5000), { type: 'sell', mint: MINT, rawAmount: 600n, all: true });
-  applySell(s, MINT, 600n, 0.05);
+  applySell(s, MINT, 600n, 0.05, 5000, 'leader sold');
   assert.equal(s.positions[MINT], undefined);
   assert.ok(Math.abs(s.realizedPnlSol - 0) < 1e-12);
 });
@@ -186,4 +191,46 @@ test('leaderboard ranks by profit on quantity bought and sold inside the window'
     { address: 'B', profitUsd: 420, roundTrips: 2 },
     { address: 'A', profitUsd: 150, roundTrips: 2 },
   ]);
+});
+
+test('entry check rejects thin liquidity and prices that ran away from the leader', () => {
+  const q = { buySol: 0.1, tokensOut: 1000n, sellBackSol: 0.097, leaderSolPerToken: 0.0001 };
+  assert.equal(checkEntry(q, LIM), null);
+  assert.match(checkEntry({ ...q, sellBackSol: 0.09 }, LIM)!, /round trip would lose 10\.0%/);
+  // We pay 0.0001 per token; the leader paid 0.00009, so we are 11% above.
+  assert.match(checkEntry({ ...q, leaderSolPerToken: 0.00009 }, LIM)!, /11\.1% above/);
+  // A better price than the leader is fine, and an unknown leader price is not a reason to skip.
+  assert.equal(checkEntry({ ...q, leaderSolPerToken: 0.0002 }, LIM), null);
+  assert.equal(checkEntry({ ...q, leaderSolPerToken: null }, LIM), null);
+  assert.equal(checkEntry({ ...q, tokensOut: 0n }, LIM), 'quote returned no tokens');
+  assert.equal(checkEntry({ ...q, sellBackSol: 0.01 }, { maxRoundTripLossPct: 0, maxPriceDriftPct: 0 }), null);
+});
+
+test('own exits: stop-loss and max hold', () => {
+  const pos = { leader: LEADER, tokens: '1', costSol: 0.1, openedAt: 1000 };
+  assert.equal(exitReason(pos, 0.08, 1100, LIM), null);
+  assert.equal(exitReason(pos, 0.075, 1100, LIM), 'stop-loss');
+  assert.equal(exitReason(pos, 0.2, 1000 + 3600, LIM), 'max hold');
+  assert.equal(exitReason(pos, 0.01, 1000 + 99999, { stopLossPct: 0, maxHoldMinutes: 0 }), null);
+});
+
+test('a leader who loses us money over enough sells gets no new buys, but exits are still followed', () => {
+  const ROOMY = { ...LIM, maxDailySol: 10 }; // keep the daily cap out of the way
+  const s = emptyState();
+  for (const mint of ['a', 'b']) {
+    applyBuy(s, mint, LEADER, 100n, 0.1, 1000);
+    assert.equal(decide(buy('c'), LEADER, s, ROOMY, 1010).type, 'buy'); // not yet dropped
+    applySell(s, mint, 100n, 0.08, 1005, 'stop-loss');
+  }
+  assert.deepEqual(s.leaderStats[LEADER].sells, 2);
+  assert.match((decide(buy('c'), LEADER, s, ROOMY, 1010) as { reason: string }).reason, /leader dropped/);
+  assert.equal(decide(buy('c'), OTHER, s, ROOMY, 1010).type, 'buy');
+  assert.equal(s.closed[1].reason, 'stop-loss');
+
+  // A leader in profit is kept however many sells.
+  const w = emptyState();
+  applyBuy(w, 'a', LEADER, 100n, 0.1, 1000);
+  applySell(w, 'a', 50n, 0.2, 1005, 'leader sold');
+  applySell(w, 'a', 50n, 0.01, 1006, 'leader sold');
+  assert.equal(decide(buy('c'), LEADER, w, ROOMY, 1010).type, 'buy');
 });

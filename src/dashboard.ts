@@ -1,13 +1,11 @@
 // Read-only status page: mode, PnL, open positions, watched leaders, recent log.
 import { createServer } from 'node:http';
-import type { State } from './strategy.ts';
+import { isDropped, type Limits, type State } from './strategy.ts';
 
 export interface DashboardData {
   mode: string;
   startedAt: number;
-  buySol: number;
-  maxDailySol: number;
-  maxOpenPositions: number;
+  limits: Limits;
   state: State;
   /** Current sale value in SOL of each open position, by mint. */
   marks: Map<string, number>;
@@ -69,8 +67,8 @@ ${tile('Total PnL', sol(pnl + unrealized), cls(pnl + unrealized))}
 ${tile('Realized', sol(pnl), cls(pnl))}
 ${tile('Unrealized', sol(unrealized), cls(unrealized))}
 ${tile('Winning sells', closed.length ? `${wins} / ${closed.length}` : '–')}
-${tile('Open positions', `${positions.length} / ${d.maxOpenPositions}`)}
-${tile('Spent today', `${spent.toFixed(2)} / ${d.maxDailySol} SOL`)}
+${tile('Open positions', `${positions.length} / ${d.limits.maxOpenPositions}`)}
+${tile('Spent today', `${spent.toFixed(2)} / ${d.limits.maxDailySol} SOL`)}
 </div>
 <h2>Open positions</h2>
 <div class="card">${
@@ -88,12 +86,12 @@ ${tile('Spent today', `${spent.toFixed(2)} / ${d.maxDailySol} SOL`)}
 <div class="card">${
     closed.length === 0
       ? '<div class="empty">None yet</div>'
-      : `<table><tr><th>Sold (UTC)</th><th>Token</th><th>Proceeds</th><th>PnL</th><th>Copied from</th></tr>${[...closed]
+      : `<table><tr><th>Sold (UTC)</th><th>Token</th><th>Proceeds</th><th>PnL</th><th>Why</th><th>Copied from</th></tr>${[...closed]
           .reverse()
           .slice(0, 50)
           .map(
             (c) =>
-              `<tr><td>${time(c.time)}</td><td>${link('token', c.mint)}</td><td>${c.proceedsSol.toFixed(4)} SOL</td><td class="${cls(c.pnlSol)}">${sol(c.pnlSol)}</td><td>${link('account', c.leader)}</td></tr>`,
+              `<tr><td>${time(c.time)}</td><td>${link('token', c.mint)}</td><td>${c.proceedsSol.toFixed(4)} SOL</td><td class="${cls(c.pnlSol)}">${sol(c.pnlSol)}</td><td>${esc(c.reason ?? '')}</td><td>${link('account', c.leader)}</td></tr>`,
           )
           .join('')}</table>`
   }</div>
@@ -101,8 +99,11 @@ ${tile('Spent today', `${spent.toFixed(2)} / ${d.maxDailySol} SOL`)}
 <div class="card">${
     d.leaders.length === 0
       ? '<div class="empty">None yet</div>'
-      : `<table><tr><th>Label</th><th>Wallet</th></tr>${d.leaders
-          .map((l) => `<tr><td>${esc(l.label ?? '')}</td><td>${link('account', l.address)}</td></tr>`)
+      : `<table><tr><th>Label</th><th>Wallet</th><th>Copied sells</th><th>Our PnL</th><th>Status</th></tr>${d.leaders
+          .map((l) => {
+            const st = d.state.leaderStats[l.address];
+            return `<tr><td>${esc(l.label ?? '')}</td><td>${link('account', l.address)}</td><td>${st?.sells ?? 0}</td><td class="${st ? cls(st.pnlSol) : ''}">${st ? sol(st.pnlSol) : '–'}</td><td>${isDropped(d.state, l.address, d.limits) ? 'dropped: no new buys' : 'copying'}</td></tr>`;
+          })
           .join('')}</table>`
   }</div>
 <h2>Activity</h2>

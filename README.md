@@ -64,6 +64,11 @@ Requires Node 22.18+.
 | `minLeaderBuySol` / `minLeaderBuyUsd` | Ignore leader buys smaller than this. FOMO users mostly pay in USDC, so the USD one usually applies |
 | `pollSeconds` | Pause between polling rounds. Each round costs one RPC call per leader |
 | `dashboardPort` | Serve a read-only status page on `http://127.0.0.1:<port>`. Off when unset |
+| `maxRoundTripLossPct` | Skip a buy if selling straight back would lose more than this (thin liquidity). 0 disables |
+| `maxPriceDriftPct` | Skip a buy if the price is this much above what the leader paid. 0 disables |
+| `stopLossPct` | Sell a position once it is worth this much less than it cost. 0 disables |
+| `maxHoldMinutes` | Sell a position held longer than this. 0 disables |
+| `dropLeaderAfter` | Stop buying from a leader who is net negative for us after this many copied sells. 0 disables |
 | `maxTradeAgeSec` | Ignore buys seen later than this (sells are always followed) |
 | `slippageBps`, `priorityFeeLamports` | Swap execution settings |
 | `blockedMints` | Tokens never to buy |
@@ -73,10 +78,13 @@ Positions and realized PnL are kept in `state.json`.
 
 ## Limits you should know
 
-- Exits only happen when the leader sells. There is no stop-loss or take-profit.
+- Exits happen when the leader sells, on the stop-loss, or at the hold limit.
+  Positions are re-priced every 15 seconds, so a fast crash can overshoot the
+  stop-loss. There is no take-profit.
 - A leader trade is seen up to one polling round late. Trades made while the bot
   is stopped are not replayed.
-- No token safety checks (honeypots, freeze authority, liquidity).
+- Token safety is limited to the round-trip quote check. No checks for freeze
+  or mint authority.
 - Token-to-token swaps by a leader are ignored; only SOL/USDC/USDT pairs are copied.
 - Solana only. FOMO also runs on other chains.
 - You always fill after the leader, at a worse price. Leaders who know they are

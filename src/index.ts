@@ -1,11 +1,14 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
-import { loadConfig, type Config } from './config.ts';
+import { loadConfig } from './config.ts';
 import { startDashboard } from './dashboard.ts';
-import { decodeTrade, WSOL, type TxLike } from './decode.ts';
+import { decodeTrade, WSOL, type LeaderTrade, type TxLike } from './decode.ts';
 import { buildSwap, getQuote, type Quote } from './jupiter.ts';
 import { fetchLeaderboard } from './leaderboard.ts';
-import { applyBuy, applySell, decide, emptyState, type State } from './strategy.ts';
+import { applyBuy, applySell, checkEntry, decide, emptyState, exitReason, type State } from './strategy.ts';
+
+const USDC = 'EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v';
+const MARK_SECONDS = 15; // how often open positions are re-priced
 
 const lines: string[] = []; // recent log, for the dashboard
 const log = (...a: unknown[]) => {
@@ -18,6 +21,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const cfg = loadConfig();
+const tag = cfg.mode === 'paper' ? '[paper]' : '[live]';
 // Only used for live trading (sending swaps, reading our own balances).
 const conn = new Connection(cfg.rpcUrl, { commitment: 'confirmed', wsEndpoint: cfg.wsUrl });
 const state: State = existsSync(cfg.stateFile)
@@ -69,19 +73,75 @@ async function ourTokenBalance(mint: string): Promise<bigint> {
 }
 
 /** Paper mode: the quote is the fill. Live mode: sign, send and confirm the swap. */
-async function swap(c: Config, inputMint: string, outputMint: string, rawAmount: bigint): Promise<Quote> {
-  const quote = await getQuote(c, inputMint, outputMint, rawAmount);
-  if (c.mode === 'paper') return quote;
-
-  const kp = c.keypair!;
-  const tx = VersionedTransaction.deserialize(Buffer.from(await buildSwap(c, quote, kp.publicKey.toBase58()), 'base64'));
+async function execute(quote: Quote) {
+  if (cfg.mode === 'paper') return;
+  const kp = cfg.keypair!;
+  const tx = VersionedTransaction.deserialize(Buffer.from(await buildSwap(cfg, quote, kp.publicKey.toBase58()), 'base64'));
   tx.sign([kp]);
   const signature = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: true, maxRetries: 3 });
   const bh = await conn.getLatestBlockhash('confirmed');
   const result = await conn.confirmTransaction({ signature, ...bh }, 'confirmed');
   if (result.value.err) throw new Error(`swap ${signature} failed on-chain: ${JSON.stringify(result.value.err)}`);
   log(`  tx https://solscan.io/tx/${signature}`);
-  return quote;
+}
+
+let solUsd = { price: 0, at: 0 };
+async function solPriceUsd(): Promise<number> {
+  if (Date.now() - solUsd.at > 60_000) {
+    const q = await getQuote(cfg, WSOL, USDC, 1_000_000_000n);
+    solUsd = { price: Number(q.outAmount) / 1e6, at: Date.now() };
+  }
+  return solUsd.price;
+}
+
+/** What the leader paid, in SOL per raw token unit. */
+async function leaderPrice(trade: LeaderTrade): Promise<number | null> {
+  const tokens = Number(trade.tokenPost - trade.tokenPre);
+  if (!(tokens > 0)) return null;
+  const sol = trade.quote === 'SOL' ? trade.quoteAmount : trade.quoteAmount / (await solPriceUsd());
+  return sol / tokens;
+}
+
+async function buy(mint: string, sol: number, leader: Leader, trade: LeaderTrade) {
+  const quote = await getQuote(cfg, WSOL, mint, BigInt(Math.round(sol * 1e9)));
+  const tokensOut = BigInt(quote.outAmount);
+  const back = tokensOut > 0n ? await getQuote(cfg, mint, WSOL, tokensOut) : null;
+  const reason = checkEntry(
+    {
+      buySol: sol,
+      tokensOut,
+      sellBackSol: back ? Number(back.outAmount) / 1e9 : 0,
+      leaderSolPerToken: await leaderPrice(trade).catch(() => null),
+    },
+    cfg,
+  );
+  if (reason) return log(`  skip: ${reason}`);
+
+  await execute(quote);
+  // Live fills can differ slightly from the quote; sells re-check the real balance.
+  applyBuy(state, mint, leader.address, tokensOut, sol, nowSec());
+  saveState();
+  log(`  ${tag} bought ${quote.outAmount} raw of ${mint} for ${sol} SOL`);
+}
+
+async function sell(mint: string, rawAmount: bigint, all: boolean, reason: string) {
+  let amount = rawAmount;
+  if (cfg.mode === 'live') {
+    const actual = await ourTokenBalance(mint);
+    if (all || amount > actual) amount = actual;
+  }
+  if (amount === 0n) {
+    delete state.positions[mint];
+    saveState();
+    return log('  nothing to sell, position dropped');
+  }
+  const quote = await getQuote(cfg, mint, WSOL, amount);
+  await execute(quote);
+  const proceeds = Number(quote.outAmount) / 1e9;
+  applySell(state, mint, all ? BigInt(state.positions[mint].tokens) : amount, proceeds, nowSec(), reason);
+  saveState();
+  const pnl = state.closed[state.closed.length - 1].pnlSol;
+  log(`  ${tag} sold ${amount} raw of ${mint} for ${proceeds} SOL (${reason}, PnL ${pnl.toFixed(4)} SOL)`);
 }
 
 type Leader = { address: string; label?: string };
@@ -96,39 +156,27 @@ async function handle(signature: string, leader: Leader) {
   log(`${name} ${trade.side} ${trade.mint} for ${trade.quoteAmount} ${trade.quote}`);
   const d = decide(trade, leader.address, state, cfg, nowSec());
   if (d.type === 'skip') return log(`  skip: ${d.reason}`);
+  if (d.type === 'buy') await buy(d.mint, d.sol, leader, trade);
+  else await sell(d.mint, d.rawAmount, d.all, 'leader sold');
+}
 
-  const tag = cfg.mode === 'paper' ? '[paper]' : '[live]';
-  if (d.type === 'buy') {
-    const quote = await swap(cfg, WSOL, d.mint, BigInt(Math.round(d.sol * 1e9)));
-    // Live fills can differ slightly from the quote; sells re-check the real balance.
-    applyBuy(state, d.mint, leader.address, BigInt(quote.outAmount), d.sol, nowSec());
-    log(`  ${tag} bought ${quote.outAmount} raw of ${d.mint} for ${d.sol} SOL`);
-  } else {
-    let amount = d.rawAmount;
-    if (cfg.mode === 'live') {
-      const actual = await ourTokenBalance(d.mint);
-      if (d.all || amount > actual) amount = actual;
-    }
-    if (amount === 0n) {
-      delete state.positions[d.mint];
-      saveState();
-      return log('  nothing to sell, position dropped');
-    }
-    const quote = await swap(cfg, d.mint, WSOL, amount);
-    const proceeds = Number(quote.outAmount) / 1e9;
-    const before = state.realizedPnlSol;
-    applySell(state, d.mint, d.all ? BigInt(state.positions[d.mint].tokens) : amount, proceeds);
-    state.closed.push({
-      time: nowSec(),
-      mint: d.mint,
-      leader: leader.address,
-      proceedsSol: proceeds,
-      pnlSol: state.realizedPnlSol - before,
-    });
-    if (state.closed.length > 200) state.closed.shift();
-    log(`  ${tag} sold ${amount} raw of ${d.mint} for ${proceeds} SOL (realized PnL ${state.realizedPnlSol.toFixed(4)} SOL)`);
+// What each open position would fetch if sold now. Drives our own exits and
+// the dashboard.
+const marks = new Map<string, number>();
+let lastMark = 0;
+
+async function markPositions() {
+  for (const mint of [...marks.keys()]) if (!state.positions[mint]) marks.delete(mint);
+  for (const [mint, p] of Object.entries(state.positions)) {
+    const quote = await getQuote(cfg, mint, WSOL, BigInt(p.tokens)).catch(() => null);
+    if (!quote) continue;
+    const value = Number(quote.outAmount) / 1e9;
+    marks.set(mint, value);
+    const reason = exitReason(p, value, nowSec(), cfg);
+    if (!reason) continue;
+    log(`${reason} on ${mint}: worth ${value.toFixed(4)} SOL, cost ${p.costSol.toFixed(4)} SOL`);
+    await sell(mint, BigInt(p.tokens), true, reason).catch((e) => log(`  exit failed for ${mint}:`, e.message));
   }
-  saveState();
 }
 
 // Leaders are polled over HTTP rather than a websocket: a dropped connection
@@ -177,9 +225,7 @@ if (cfg.dashboardPort) {
   startDashboard(cfg.dashboardPort, host, () => ({
     mode: cfg.mode,
     startedAt,
-    buySol: cfg.buySol,
-    maxDailySol: cfg.maxDailySol,
-    maxOpenPositions: cfg.maxOpenPositions,
+    limits: cfg,
     state,
     marks,
     leaders: [...watched.values()].map((w) => w.leader),
@@ -202,21 +248,9 @@ if (cfg.leaderboard) {
 log(`mode=${cfg.mode} watching ${watched.size} leader(s), ${Object.keys(state.positions).length} open position(s)`);
 if (cfg.mode === 'live') log(`trading wallet ${cfg.keypair!.publicKey.toBase58()}`);
 
-// What each open position would fetch if sold now, for the dashboard only.
-const marks = new Map<string, number>();
-let lastMark = 0;
-
-async function markPositions() {
-  for (const mint of [...marks.keys()]) if (!state.positions[mint]) marks.delete(mint);
-  for (const [mint, p] of Object.entries(state.positions)) {
-    const quote = await getQuote(cfg, mint, WSOL, BigInt(p.tokens)).catch(() => null);
-    if (quote) marks.set(mint, Number(quote.outAmount) / 1e9);
-  }
-}
-
 // One leader and one trade at a time, so limits and state are never raced.
 while (true) {
-  if (cfg.dashboardPort && Date.now() - lastMark > 30_000) {
+  if (Date.now() - lastMark > MARK_SECONDS * 1000) {
     lastMark = Date.now();
     await markPositions();
   }
