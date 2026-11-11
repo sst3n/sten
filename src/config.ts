@@ -9,6 +9,8 @@ export interface Config extends Limits {
   leaders: { address: string; label?: string }[];
   /** When set, top FOMO wallets from Bitquery are copied in addition to `leaders`. */
   leaderboard?: LeaderboardConfig;
+  /** Pause between polling rounds over all leaders. */
+  pollSeconds: number;
   slippageBps: number;
   priorityFeeLamports: number;
   jupiterBaseUrl: string;
@@ -29,6 +31,7 @@ const DEFAULTS = {
   minLeaderBuySol: 0.5,
   minLeaderBuyUsd: 100,
   maxTradeAgeSec: 30,
+  pollSeconds: 2,
   slippageBps: 300,
   priorityFeeLamports: 100_000,
   blockedMints: [],

@@ -11,6 +11,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const nowSec = () => Math.floor(Date.now() / 1000);
 
 const cfg = loadConfig();
+// Only used for live trading (sending swaps, reading our own balances).
 const conn = new Connection(cfg.rpcUrl, { commitment: 'confirmed', wsEndpoint: cfg.wsUrl });
 const state: State = existsSync(cfg.stateFile)
   ? { ...emptyState(), ...JSON.parse(readFileSync(cfg.stateFile, 'utf8')) }
@@ -21,14 +22,35 @@ function saveState() {
   renameSync(cfg.stateFile + '.tmp', cfg.stateFile);
 }
 
-async function fetchTx(signature: string): Promise<TxLike | null> {
-  // Right after the log notification the transaction is often not queryable yet.
-  for (let i = 0; i < 5; i++) {
-    const tx = await conn.getParsedTransaction(signature, {
-      commitment: 'confirmed',
-      maxSupportedTransactionVersion: 0,
+// Plain JSON-RPC for reading leader activity. FOMO sends version 1 transactions,
+// which web3.js v1 refuses to parse, so these calls bypass it.
+async function rpc(method: string, params: unknown[]): Promise<any> {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(cfg.rpcUrl, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ jsonrpc: '2.0', id: 1, method, params }),
+      signal: AbortSignal.timeout(15_000),
     });
-    if (tx) return tx as unknown as TxLike;
+    if (res.status === 429 && attempt < 4) {
+      await sleep(1000 * (attempt + 1));
+      continue;
+    }
+    if (!res.ok) throw new Error(`RPC ${method} failed: ${res.status}`);
+    const body = await res.json();
+    if (body.error) throw new Error(`RPC ${method}: ${JSON.stringify(body.error)}`);
+    return body.result;
+  }
+}
+
+async function fetchTx(signature: string): Promise<TxLike | null> {
+  // A just-confirmed transaction is sometimes not queryable for a moment.
+  for (let i = 0; i < 4; i++) {
+    const tx = await rpc('getTransaction', [
+      signature,
+      { encoding: 'jsonParsed', commitment: 'confirmed', maxSupportedTransactionVersion: 1 },
+    ]);
+    if (tx) return tx;
     await sleep(400 * (i + 1));
   }
   return null;
@@ -55,7 +77,9 @@ async function swap(c: Config, inputMint: string, outputMint: string, rawAmount:
   return quote;
 }
 
-async function handle(signature: string, leader: { address: string; label?: string }) {
+type Leader = { address: string; label?: string };
+
+async function handle(signature: string, leader: Leader) {
   const tx = await fetchTx(signature);
   if (!tx) return log(`could not fetch ${signature}, skipping`);
   const trade = decodeTrade(tx, leader.address);
@@ -91,34 +115,35 @@ async function handle(signature: string, leader: { address: string; label?: stri
   saveState();
 }
 
-// One trade at a time, so limits and state are never raced.
-let queue: Promise<void> = Promise.resolve();
-const seen = new Set<string>();
-const watched = new Map<string, number>(); // leader address -> log subscription id
+// Leaders are polled over HTTP rather than a websocket: a dropped connection
+// then loses nothing, because each poll resumes from the last seen signature.
+const watched = new Map<string, { leader: Leader; cursor: string | null }>();
 
-function watch(leader: { address: string; label?: string }) {
+async function watch(leader: Leader) {
   if (watched.has(leader.address)) return;
-  const id = conn.onLogs(
-    new PublicKey(leader.address),
-    (logs) => {
-      const key = `${logs.signature}:${leader.address}`;
-      if (logs.err || seen.has(key)) return;
-      seen.add(key);
-      if (seen.size > 10_000) seen.clear();
-      queue = queue.then(() => handle(logs.signature, leader)).catch((e) => log(`error on ${logs.signature}:`, e));
-    },
-    'confirmed',
-  );
-  watched.set(leader.address, id);
+  // Start from the leader's latest transaction so old trades are not replayed.
+  const latest = await rpc('getSignaturesForAddress', [leader.address, { limit: 1, commitment: 'confirmed' }]);
+  watched.set(leader.address, { leader, cursor: latest[0]?.signature ?? null });
+}
+
+async function poll(entry: { leader: Leader; cursor: string | null }) {
+  const sigs: { signature: string; err: unknown }[] = await rpc('getSignaturesForAddress', [
+    entry.leader.address,
+    { limit: 50, commitment: 'confirmed', ...(entry.cursor ? { until: entry.cursor } : {}) },
+  ]);
+  if (sigs.length === 0) return;
+  entry.cursor = sigs[0].signature; // newest first
+  for (const s of sigs.reverse()) {
+    if (s.err) continue;
+    await handle(s.signature, entry.leader).catch((e) => log(`error on ${s.signature}:`, e.message));
+  }
 }
 
 async function refreshLeaderboard() {
   const board = await fetchLeaderboard(cfg.leaderboard!, cfg.bitqueryToken!);
   log(`leaderboard: ${board.length} wallet(s) qualify`);
-  board.forEach((w, i) => {
-    log(`  #${i + 1} ${w.address} +$${w.profitUsd.toFixed(0)} over ${w.roundTrips} round trips`);
-    watch({ address: w.address, label: `fomo-${w.address.slice(0, 4)}` });
-  });
+  board.forEach((w, i) => log(`  #${i + 1} ${w.address} +$${w.profitUsd.toFixed(0)} over ${w.roundTrips} round trips`));
+  for (const w of board) await watch({ address: w.address, label: `fomo-${w.address.slice(0, 4)}` });
 
   // Keep watching anyone we still hold a position from, so their exit is followed.
   const keep = new Set([
@@ -126,16 +151,12 @@ async function refreshLeaderboard() {
     ...board.map((w) => w.address),
     ...Object.values(state.positions).map((p) => p.leader),
   ]);
-  for (const [address, id] of watched) {
-    if (keep.has(address)) continue;
-    watched.delete(address);
-    await conn.removeOnLogsListener(id);
-  }
+  for (const address of [...watched.keys()]) if (!keep.has(address)) watched.delete(address);
 }
 
-cfg.leaders.forEach(watch);
+for (const l of cfg.leaders) await watch(l);
 // Positions opened from a leaderboard wallet in an earlier run still need their exit.
-for (const p of Object.values(state.positions)) watch({ address: p.leader });
+for (const p of Object.values(state.positions)) await watch({ address: p.leader });
 
 if (cfg.leaderboard) {
   // A failed refresh keeps the current set; the next one tries again.
@@ -146,3 +167,11 @@ if (cfg.leaderboard) {
 
 log(`mode=${cfg.mode} watching ${watched.size} leader(s), ${Object.keys(state.positions).length} open position(s)`);
 if (cfg.mode === 'live') log(`trading wallet ${cfg.keypair!.publicKey.toBase58()}`);
+
+// One leader and one trade at a time, so limits and state are never raced.
+while (true) {
+  for (const entry of [...watched.values()]) {
+    await poll(entry).catch((e) => log(`poll failed for ${entry.leader.address}:`, e.message));
+  }
+  await sleep(cfg.pollSeconds * 1000);
+}

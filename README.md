@@ -10,8 +10,8 @@ Jupiter; when that wallet sells, the bot sells the same fraction of its position
 ## How it gets FOMO's trades
 
 FOMO has no public API. Every FOMO user trades from their own on-chain wallet,
-so the bot watches those wallets directly over a Solana RPC websocket and reads
-each transaction's balance changes. It does not talk to FOMO at all.
+so the bot polls those wallets over Solana RPC every few seconds and reads each
+new transaction's balance changes. It does not talk to FOMO at all.
 
 Two ways to choose who to copy; they can be combined:
 
@@ -41,7 +41,7 @@ are not on-chain, so usernames cannot be linked to wallets.
 ```sh
 npm install
 cp config.example.json config.json   # add leader wallets, set limits
-cp .env.example .env                 # add RPC_URL (needs websockets), BITQUERY_TOKEN
+cp .env.example .env                 # add RPC_URL, BITQUERY_TOKEN
 npm start
 ```
 
@@ -62,6 +62,7 @@ Requires Node 22.18+.
 | `maxOpenPositions` | Stop opening positions beyond this many |
 | `maxDailySol` | Cap on SOL spent on buys per UTC day |
 | `minLeaderBuySol` / `minLeaderBuyUsd` | Ignore leader buys smaller than this. FOMO users mostly pay in USDC, so the USD one usually applies |
+| `pollSeconds` | Pause between polling rounds. Each round costs one RPC call per leader |
 | `maxTradeAgeSec` | Ignore buys seen later than this (sells are always followed) |
 | `slippageBps`, `priorityFeeLamports` | Swap execution settings |
 | `blockedMints` | Tokens never to buy |
@@ -72,7 +73,8 @@ Positions and realized PnL are kept in `state.json`.
 ## Limits you should know
 
 - Exits only happen when the leader sells. There is no stop-loss or take-profit.
-- Trades made while the websocket is disconnected are missed, including sells.
+- A leader trade is seen up to one polling round late. Trades made while the bot
+  is stopped are not replayed.
 - No token safety checks (honeypots, freeze authority, liquidity).
 - Token-to-token swaps by a leader are ignored; only SOL/USDC/USDT pairs are copied.
 - Solana only. FOMO also runs on other chains.
@@ -86,8 +88,7 @@ npm test        # trade decoding and copy rules
 npm run typecheck
 ```
 
-Not yet run against real services: the Bitquery leaderboard query, the RPC
-wallet watcher and the Jupiter swaps. In particular, FOMO signs and pays gas
-for its users' trades, and it is unconfirmed that the websocket subscription
-sees those transactions for a user's wallet. Run in paper mode first and check
-that leader trades show up in the log.
+Checked against mainnet: leader polling, decoding of real FOMO trades (the
+user's wallet co-signs each one), and Jupiter quotes in paper mode. Not yet run
+against real services: the Bitquery leaderboard query and live swaps. Run in
+paper mode first.
