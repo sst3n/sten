@@ -1,11 +1,14 @@
 import { readFileSync } from 'node:fs';
 import { Keypair, PublicKey } from '@solana/web3.js';
 import bs58 from 'bs58';
+import { LEADERBOARD_DEFAULTS, type LeaderboardConfig } from './leaderboard.ts';
 import type { Limits } from './strategy.ts';
 
 export interface Config extends Limits {
   mode: 'paper' | 'live';
   leaders: { address: string; label?: string }[];
+  /** When set, top FOMO wallets from Bitquery are copied in addition to `leaders`. */
+  leaderboard?: LeaderboardConfig;
   slippageBps: number;
   priorityFeeLamports: number;
   jupiterBaseUrl: string;
@@ -14,6 +17,7 @@ export interface Config extends Limits {
   rpcUrl: string;
   wsUrl?: string;
   jupiterApiKey?: string;
+  bitqueryToken?: string;
   keypair?: Keypair;
 }
 
@@ -21,7 +25,7 @@ const DEFAULTS = {
   mode: 'paper',
   buySol: 0.05,
   maxOpenPositions: 5,
-  maxDailySol: 0.5,
+  maxDailySol: 0.25,
   minLeaderBuySol: 0.5,
   minLeaderBuyUsd: 100,
   maxTradeAgeSec: 30,
@@ -48,7 +52,14 @@ export function loadConfig(): Config {
   const cfg = { ...DEFAULTS, ...file } as unknown as Config;
 
   if (cfg.mode !== 'paper' && cfg.mode !== 'live') throw new Error('mode must be "paper" or "live"');
-  if (!Array.isArray(cfg.leaders) || cfg.leaders.length === 0) throw new Error('config.leaders is empty');
+  cfg.leaders ??= [];
+  if (cfg.leaderboard) {
+    cfg.leaderboard = { ...LEADERBOARD_DEFAULTS, ...cfg.leaderboard };
+    if (!process.env.BITQUERY_TOKEN) throw new Error('config.leaderboard requires BITQUERY_TOKEN (see .env.example)');
+    cfg.bitqueryToken = process.env.BITQUERY_TOKEN;
+  } else if (cfg.leaders.length === 0) {
+    throw new Error('nothing to copy: set config.leaders or config.leaderboard');
+  }
   for (const l of cfg.leaders) {
     try {
       new PublicKey(l.address);

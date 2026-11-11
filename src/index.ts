@@ -3,6 +3,7 @@ import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { loadConfig, type Config } from './config.ts';
 import { decodeTrade, WSOL, type TxLike } from './decode.ts';
 import { buildSwap, getQuote, type Quote } from './jupiter.ts';
+import { fetchLeaderboard } from './leaderboard.ts';
 import { applyBuy, applySell, decide, emptyState, type State } from './strategy.ts';
 
 const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
@@ -93,9 +94,11 @@ async function handle(signature: string, leader: { address: string; label?: stri
 // One trade at a time, so limits and state are never raced.
 let queue: Promise<void> = Promise.resolve();
 const seen = new Set<string>();
+const watched = new Map<string, number>(); // leader address -> log subscription id
 
-for (const leader of cfg.leaders) {
-  conn.onLogs(
+function watch(leader: { address: string; label?: string }) {
+  if (watched.has(leader.address)) return;
+  const id = conn.onLogs(
     new PublicKey(leader.address),
     (logs) => {
       const key = `${logs.signature}:${leader.address}`;
@@ -106,7 +109,40 @@ for (const leader of cfg.leaders) {
     },
     'confirmed',
   );
+  watched.set(leader.address, id);
 }
 
-log(`mode=${cfg.mode} watching ${cfg.leaders.length} leader(s), ${Object.keys(state.positions).length} open position(s)`);
+async function refreshLeaderboard() {
+  const board = await fetchLeaderboard(cfg.leaderboard!, cfg.bitqueryToken!);
+  log(`leaderboard: ${board.length} wallet(s) qualify`);
+  board.forEach((w, i) => {
+    log(`  #${i + 1} ${w.address} +$${w.profitUsd.toFixed(0)} over ${w.roundTrips} round trips`);
+    watch({ address: w.address, label: `fomo-${w.address.slice(0, 4)}` });
+  });
+
+  // Keep watching anyone we still hold a position from, so their exit is followed.
+  const keep = new Set([
+    ...cfg.leaders.map((l) => l.address),
+    ...board.map((w) => w.address),
+    ...Object.values(state.positions).map((p) => p.leader),
+  ]);
+  for (const [address, id] of watched) {
+    if (keep.has(address)) continue;
+    watched.delete(address);
+    await conn.removeOnLogsListener(id);
+  }
+}
+
+cfg.leaders.forEach(watch);
+// Positions opened from a leaderboard wallet in an earlier run still need their exit.
+for (const p of Object.values(state.positions)) watch({ address: p.leader });
+
+if (cfg.leaderboard) {
+  // A failed refresh keeps the current set; the next one tries again.
+  const refresh = () => refreshLeaderboard().catch((e) => log('leaderboard refresh failed:', e.message));
+  await refresh();
+  setInterval(refresh, cfg.leaderboard.refreshMinutes * 60_000);
+}
+
+log(`mode=${cfg.mode} watching ${watched.size} leader(s), ${Object.keys(state.positions).length} open position(s)`);
 if (cfg.mode === 'live') log(`trading wallet ${cfg.keypair!.publicKey.toBase58()}`);

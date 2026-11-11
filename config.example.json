@@ -1,11 +1,16 @@
 {
   "mode": "paper",
-  "leaders": [
-    { "address": "REPLACE_WITH_TOP_TRADER_WALLET", "label": "fomo-top-1" }
-  ],
+  "leaders": [],
+  "leaderboard": {
+    "top": 5,
+    "hours": 12,
+    "minRoundTrips": 3,
+    "minProfitUsd": 100,
+    "refreshMinutes": 60
+  },
   "buySol": 0.05,
   "maxOpenPositions": 5,
-  "maxDailySol": 0.5,
+  "maxDailySol": 0.25,
   "minLeaderBuySol": 0.5,
   "minLeaderBuyUsd": 100,
   "maxTradeAgeSec": 30,

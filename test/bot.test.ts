@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { decodeTrade, WSOL, type TxLike } from '../src/decode.ts';
+import { rankWallets } from '../src/leaderboard.ts';
 import { applyBuy, applySell, decide, emptyState, type Limits } from '../src/strategy.ts';
 
 const LEADER = 'Leader1111111111111111111111111111111111111';
@@ -151,4 +152,38 @@ test('sells mirror the leader fraction, only for the leader that opened the posi
   applySell(s, MINT, 600n, 0.05);
   assert.equal(s.positions[MINT], undefined);
   assert.ok(Math.abs(s.realizedPnlSol - 0) < 1e-12);
+});
+
+test('leaderboard ranks by profit on quantity bought and sold inside the window', () => {
+  const row = (wallet: string, mint: string, boughtUsd: number, boughtAmt: number, soldUsd: number, soldAmt: number) => ({
+    wallet,
+    mint,
+    boughtUsd,
+    boughtAmt,
+    soldUsd,
+    soldAmt,
+  });
+  const opts = { top: 2, minRoundTrips: 2, minProfitUsd: 10 };
+  const ranked = rankWallets(
+    [
+      // A: +100 and +50.
+      row('A', 't1', 100, 10, 200, 10),
+      row('A', 't2', 100, 10, 150, 10),
+      // B: sold half of what it bought for +20, and dumped an old bag: only half of
+      // the $1000 sale matches the 5 bought in the window, so +400 not +900.
+      row('B', 't1', 100, 10, 70, 5),
+      row('B', 't3', 100, 5, 1000, 10),
+      // C: profitable but only one round trip. D: only bought. E: two losing trips.
+      row('C', 't1', 10, 1, 5000, 1),
+      row('D', 't1', 100, 10, 0, 0),
+      row('D', 't2', 100, 10, 0, 0),
+      row('E', 't1', 100, 10, 50, 10),
+      row('E', 't2', 100, 10, 50, 10),
+    ],
+    opts,
+  );
+  assert.deepEqual(ranked, [
+    { address: 'B', profitUsd: 420, roundTrips: 2 },
+    { address: 'A', profitUsd: 150, roundTrips: 2 },
+  ]);
 });
