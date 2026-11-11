@@ -1,12 +1,19 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { Connection, PublicKey, VersionedTransaction } from '@solana/web3.js';
 import { loadConfig, type Config } from './config.ts';
+import { startDashboard } from './dashboard.ts';
 import { decodeTrade, WSOL, type TxLike } from './decode.ts';
 import { buildSwap, getQuote, type Quote } from './jupiter.ts';
 import { fetchLeaderboard } from './leaderboard.ts';
 import { applyBuy, applySell, decide, emptyState, type State } from './strategy.ts';
 
-const log = (...a: unknown[]) => console.log(new Date().toISOString(), ...a);
+const lines: string[] = []; // recent log, for the dashboard
+const log = (...a: unknown[]) => {
+  const line = [new Date().toISOString(), ...a].join(' ');
+  console.log(line);
+  lines.push(line);
+  if (lines.length > 200) lines.shift();
+};
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const nowSec = () => Math.floor(Date.now() / 1000);
 
@@ -152,6 +159,23 @@ async function refreshLeaderboard() {
     ...Object.values(state.positions).map((p) => p.leader),
   ]);
   for (const address of [...watched.keys()]) if (!keep.has(address)) watched.delete(address);
+}
+
+if (cfg.dashboardPort) {
+  const startedAt = Date.now();
+  // Local only by default; the page shows your positions.
+  const host = process.env.DASHBOARD_HOST ?? '127.0.0.1';
+  startDashboard(cfg.dashboardPort, host, () => ({
+    mode: cfg.mode,
+    startedAt,
+    buySol: cfg.buySol,
+    maxDailySol: cfg.maxDailySol,
+    maxOpenPositions: cfg.maxOpenPositions,
+    state,
+    leaders: [...watched.values()].map((w) => w.leader),
+    lines,
+  }));
+  log(`dashboard on http://${host}:${cfg.dashboardPort}`);
 }
 
 for (const l of cfg.leaders) await watch(l);

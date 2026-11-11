@@ -9,6 +9,8 @@ export interface Config extends Limits {
   leaders: { address: string; label?: string }[];
   /** When set, top FOMO wallets from Bitquery are copied in addition to `leaders`. */
   leaderboard?: LeaderboardConfig;
+  /** Serve a read-only status page on this port. Off when unset. */
+  dashboardPort?: number;
   /** Pause between polling rounds over all leaders. */
   pollSeconds: number;
   slippageBps: number;

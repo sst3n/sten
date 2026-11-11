@@ -63,6 +63,7 @@ Requires Node 22.18+.
 | `maxDailySol` | Cap on SOL spent on buys per UTC day |
 | `minLeaderBuySol` / `minLeaderBuyUsd` | Ignore leader buys smaller than this. FOMO users mostly pay in USDC, so the USD one usually applies |
 | `pollSeconds` | Pause between polling rounds. Each round costs one RPC call per leader |
+| `dashboardPort` | Serve a read-only status page on `http://127.0.0.1:<port>`. Off when unset |
 | `maxTradeAgeSec` | Ignore buys seen later than this (sells are always followed) |
 | `slippageBps`, `priorityFeeLamports` | Swap execution settings |
 | `blockedMints` | Tokens never to buy |
