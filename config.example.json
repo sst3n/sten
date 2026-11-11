@@ -1,0 +1,17 @@
+{
+  "mode": "paper",
+  "leaders": [
+    { "address": "REPLACE_WITH_TOP_TRADER_WALLET", "label": "fomo-top-1" }
+  ],
+  "buySol": 0.05,
+  "maxOpenPositions": 5,
+  "maxDailySol": 0.5,
+  "minLeaderBuySol": 0.5,
+  "minLeaderBuyUsd": 100,
+  "maxTradeAgeSec": 30,
+  "slippageBps": 300,
+  "priorityFeeLamports": 100000,
+  "blockedMints": [],
+  "jupiterBaseUrl": "https://lite-api.jup.ag/swap/v1",
+  "stateFile": "state.json"
+}
