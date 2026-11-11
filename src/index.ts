@@ -116,7 +116,16 @@ async function handle(signature: string, leader: Leader) {
     }
     const quote = await swap(cfg, d.mint, WSOL, amount);
     const proceeds = Number(quote.outAmount) / 1e9;
+    const before = state.realizedPnlSol;
     applySell(state, d.mint, d.all ? BigInt(state.positions[d.mint].tokens) : amount, proceeds);
+    state.closed.push({
+      time: nowSec(),
+      mint: d.mint,
+      leader: leader.address,
+      proceedsSol: proceeds,
+      pnlSol: state.realizedPnlSol - before,
+    });
+    if (state.closed.length > 200) state.closed.shift();
     log(`  ${tag} sold ${amount} raw of ${d.mint} for ${proceeds} SOL (realized PnL ${state.realizedPnlSol.toFixed(4)} SOL)`);
   }
   saveState();
@@ -172,6 +181,7 @@ if (cfg.dashboardPort) {
     maxDailySol: cfg.maxDailySol,
     maxOpenPositions: cfg.maxOpenPositions,
     state,
+    marks,
     leaders: [...watched.values()].map((w) => w.leader),
     lines,
   }));
@@ -192,8 +202,24 @@ if (cfg.leaderboard) {
 log(`mode=${cfg.mode} watching ${watched.size} leader(s), ${Object.keys(state.positions).length} open position(s)`);
 if (cfg.mode === 'live') log(`trading wallet ${cfg.keypair!.publicKey.toBase58()}`);
 
+// What each open position would fetch if sold now, for the dashboard only.
+const marks = new Map<string, number>();
+let lastMark = 0;
+
+async function markPositions() {
+  for (const mint of [...marks.keys()]) if (!state.positions[mint]) marks.delete(mint);
+  for (const [mint, p] of Object.entries(state.positions)) {
+    const quote = await getQuote(cfg, mint, WSOL, BigInt(p.tokens)).catch(() => null);
+    if (quote) marks.set(mint, Number(quote.outAmount) / 1e9);
+  }
+}
+
 // One leader and one trade at a time, so limits and state are never raced.
 while (true) {
+  if (cfg.dashboardPort && Date.now() - lastMark > 30_000) {
+    lastMark = Date.now();
+    await markPositions();
+  }
   for (const entry of [...watched.values()]) {
     await poll(entry).catch((e) => log(`poll failed for ${entry.leader.address}:`, e.message));
   }

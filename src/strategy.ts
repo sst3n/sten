@@ -23,9 +23,19 @@ export interface State {
   positions: Record<string, Position>;
   spentByDay: Record<string, number>;
   realizedPnlSol: number;
+  /** Sells, newest last, for the dashboard. */
+  closed: ClosedTrade[];
 }
 
-export const emptyState = (): State => ({ positions: {}, spentByDay: {}, realizedPnlSol: 0 });
+export interface ClosedTrade {
+  time: number;
+  mint: string;
+  leader: string;
+  proceedsSol: number;
+  pnlSol: number;
+}
+
+export const emptyState = (): State => ({ positions: {}, spentByDay: {}, realizedPnlSol: 0, closed: [] });
 
 export type Decision =
   | { type: 'buy'; mint: string; sol: number }
